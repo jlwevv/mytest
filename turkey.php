@@ -1,3 +1,3 @@
 <?php
-   echo "Hi turkey mountain\n";
+   echo "Hello from the turkey.php";
 ?>
