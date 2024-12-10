@@ -1,4 +1,1 @@
-Hi mom
-jerk
-kkk
-turkey puller
+Where in the world did that come from?
