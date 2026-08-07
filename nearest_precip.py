@@ -26,6 +26,15 @@ NO_COVERAGE = -3.0  # MRMS sentinel value for "no radar coverage" at a cell
 PRECIP_THRESHOLD_MMHR = 0.1  # anything at/above this counts as "precip"
 BBOX_STEPS_DEG = [1, 2, 4, 8, 16, 30]  # progressively widen the search
 
+# distance is stored internally in km; "knots" isn't really a distance unit
+# (it's nautical miles per hour), but we treat it as shorthand for nautical
+# miles here since that's what people asking for knots actually want.
+UNIT_CONVERSIONS = {
+    "miles": (0.621371, "mi"),
+    "km": (1.0, "km"),
+    "knots": (0.539957, "nmi"),
+}
+
 
 def load_point():
     load_dotenv()
@@ -34,7 +43,17 @@ def load_point():
         lon = float(os.environ["LON"])
     except (KeyError, ValueError) as exc:
         sys.exit(f"Set LAT and LON in .env (see .env.example): {exc}")
-    return lat, lon
+
+    units = os.environ.get("UNITS", "miles").strip().lower()
+    if units not in UNIT_CONVERSIONS:
+        sys.exit(f"Invalid UNITS '{units}' in .env - choose one of: {', '.join(UNIT_CONVERSIONS)}")
+
+    return lat, lon, units
+
+
+def convert_distance(distance_km, units):
+    factor, label = UNIT_CONVERSIONS[units]
+    return distance_km * factor, label
 
 
 def get_local_radar(lat, lon):
@@ -128,7 +147,7 @@ def find_nearest_precip(lat, lon, lats, lons, data):
 
 
 def main():
-    lat, lon = load_point()
+    lat, lon, units = load_point()
 
     print(f"Point: {lat:.4f}, {lon:.4f}")
 
@@ -150,8 +169,9 @@ def main():
         print("No precipitation detected anywhere in the search radius.")
         return
 
+    distance, unit_label = convert_distance(hit["distance_km"], units)
     print(
-        f"Nearest precip: {hit['distance_km']:.1f} km {hit['bearing']} of you "
+        f"Nearest precip: {distance:.1f} {unit_label} {hit['bearing']} of you "
         f"at {hit['lat']:.4f}, {hit['lon']:.4f} "
         f"(rate {hit['rate_mmhr']:.1f} mm/hr)"
     )
