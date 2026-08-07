@@ -10,6 +10,7 @@ one) -- there's no NWS endpoint that answers "nearest precip" from a single
 radar's raw feed directly.
 """
 
+import argparse
 import gzip
 import json
 import math
@@ -19,6 +20,14 @@ import sys
 import numpy as np
 import requests
 from dotenv import load_dotenv
+from tqdm import tqdm
+
+VERBOSE = False
+
+
+def vprint(msg):
+    if VERBOSE:
+        print(msg)
 
 NWS_POINTS_URL = "https://api.weather.gov/points/{lat},{lon}"
 MRMS_URL = "https://mrms.ncep.noaa.gov/data/2D/PrecipRate/MRMS_PrecipRate.latest.grib2.gz"
@@ -98,6 +107,31 @@ def load_cache_meta():
         return None
 
 
+def download_mrms(headers):
+    """Stream one attempt at the MRMS file. Returns (status_code, raw_bytes_or_None, last_modified)."""
+    resp = requests.get(MRMS_URL, headers=headers, stream=True, timeout=60)
+    resp.raise_for_status()
+
+    if resp.status_code == 304:
+        return 304, None, None
+
+    vprint("[download] New data available - downloading MRMS mosaic...")
+    total = int(resp.headers.get("Content-Length", 0))
+    chunks = []
+    with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
+              desc="downloading", disable=not VERBOSE) as bar:
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            chunks.append(chunk)
+            bar.update(len(chunk))
+    compressed = b"".join(chunks)
+
+    vprint("[process]  Decompressing download...")
+    # NOAA overwrites the "latest" file in place (not an atomic swap), so a
+    # download can occasionally straddle an update and land here truncated.
+    raw = gzip.decompress(compressed)
+    return 200, raw, resp.headers.get("Last-Modified")
+
+
 def fetch_mrms_precip_rate():
     os.makedirs(CACHE_DIR, exist_ok=True)
     meta = load_cache_meta()
@@ -106,21 +140,35 @@ def fetch_mrms_precip_rate():
     if meta and os.path.exists(CACHE_GRIB_PATH):
         headers["If-Modified-Since"] = meta["last_modified"]
 
-    resp = requests.get(MRMS_URL, headers=headers, timeout=60)
-    resp.raise_for_status()
+    vprint("[checking] Asking NOAA if the MRMS mosaic has updated...")
 
-    if resp.status_code == 304:
-        print("NOAA has no newer data yet - using cached download.")
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            vprint(f"[download] Retrying download (attempt {attempt}/{attempts})...")
+        try:
+            status, raw, last_modified = download_mrms(headers)
+            break
+        except (requests.RequestException, gzip.BadGzipFile, EOFError) as exc:
+            vprint(f"[download] Download failed: {exc}")
+            if attempt == attempts:
+                if os.path.exists(CACHE_GRIB_PATH):
+                    vprint("[cache]    Giving up - falling back to last good cached download.")
+                    status, raw, last_modified = 304, None, None
+                    break
+                sys.exit("Could not download MRMS data and no cached copy is available.")
+
+    if status == 304:
+        vprint("[cache]    No newer data yet - reusing cached download.")
         grib_path = CACHE_GRIB_PATH
     else:
-        raw = gzip.decompress(resp.content)
         with open(CACHE_GRIB_PATH, "wb") as f:
             f.write(raw)
-        last_modified = resp.headers.get("Last-Modified")
         with open(CACHE_META_PATH, "w") as f:
             json.dump({"last_modified": last_modified}, f)
         grib_path = CACHE_GRIB_PATH
 
+    vprint("[process]  Parsing grib data locally...")
     import cfgrib
 
     ds = cfgrib.open_dataset(grib_path)
@@ -186,10 +234,18 @@ def find_nearest_precip(lat, lon, lats, lons, data):
 
 
 def main():
+    global VERBOSE
+    parser = argparse.ArgumentParser(description="Find the closest active precipitation to a GPS point.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                         help="show download/cache/processing status and a download progress bar")
+    args = parser.parse_args()
+    VERBOSE = args.verbose
+
     lat, lon, units, rate_units = load_point()
 
     print(f"Point: {lat:.4f}, {lon:.4f}")
 
+    vprint("[download] Looking up local NWS radar station...")
     try:
         radar = get_local_radar(lat, lon)
         print(
@@ -199,10 +255,10 @@ def main():
     except requests.RequestException as exc:
         print(f"Could not look up local radar station: {exc}")
 
-    print("Fetching MRMS national radar mosaic (PrecipRate)...")
     lats, lons, data, valid_time = fetch_mrms_precip_rate()
-    print(f"Mosaic valid: {valid_time}")
+    vprint(f"[process]  Mosaic valid: {valid_time}")
 
+    vprint("[process]  Searching locally for the nearest precip echo...")
     hit = find_nearest_precip(lat, lon, lats, lons, data)
     if hit is None:
         print("No precipitation detected anywhere in the search radius.")
