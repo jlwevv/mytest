@@ -35,6 +35,11 @@ UNIT_CONVERSIONS = {
     "knots": (0.539957, "nmi"),
 }
 
+RATE_UNIT_CONVERSIONS = {
+    "mm": (1.0, "mm/hr"),
+    "in": (0.0393701, "in/hr"),
+}
+
 
 def load_point():
     load_dotenv()
@@ -48,12 +53,24 @@ def load_point():
     if units not in UNIT_CONVERSIONS:
         sys.exit(f"Invalid UNITS '{units}' in .env - choose one of: {', '.join(UNIT_CONVERSIONS)}")
 
-    return lat, lon, units
+    rate_units = os.environ.get("RATE_UNITS", "in").strip().lower()
+    if rate_units not in RATE_UNIT_CONVERSIONS:
+        sys.exit(
+            f"Invalid RATE_UNITS '{rate_units}' in .env - choose one of: "
+            f"{', '.join(RATE_UNIT_CONVERSIONS)}"
+        )
+
+    return lat, lon, units, rate_units
 
 
 def convert_distance(distance_km, units):
     factor, label = UNIT_CONVERSIONS[units]
     return distance_km * factor, label
+
+
+def convert_rate(rate_mmhr, rate_units):
+    factor, label = RATE_UNIT_CONVERSIONS[rate_units]
+    return rate_mmhr * factor, label
 
 
 def get_local_radar(lat, lon):
@@ -147,7 +164,7 @@ def find_nearest_precip(lat, lon, lats, lons, data):
 
 
 def main():
-    lat, lon, units = load_point()
+    lat, lon, units, rate_units = load_point()
 
     print(f"Point: {lat:.4f}, {lon:.4f}")
 
@@ -170,10 +187,11 @@ def main():
         return
 
     distance, unit_label = convert_distance(hit["distance_km"], units)
+    rate, rate_label = convert_rate(hit["rate_mmhr"], rate_units)
     print(
         f"Nearest precip: {distance:.1f} {unit_label} {hit['bearing']} of you "
         f"at {hit['lat']:.4f}, {hit['lon']:.4f} "
-        f"(rate {hit['rate_mmhr']:.1f} mm/hr)"
+        f"(rate {rate:.2f} {rate_label})"
     )
 
 
