@@ -11,10 +11,10 @@ radar's raw feed directly.
 """
 
 import gzip
+import json
 import math
 import os
 import sys
-import tempfile
 
 import numpy as np
 import requests
@@ -23,6 +23,9 @@ from dotenv import load_dotenv
 NWS_POINTS_URL = "https://api.weather.gov/points/{lat},{lon}"
 MRMS_URL = "https://mrms.ncep.noaa.gov/data/2D/PrecipRate/MRMS_PrecipRate.latest.grib2.gz"
 NO_COVERAGE = -3.0  # MRMS sentinel value for "no radar coverage" at a cell
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+CACHE_GRIB_PATH = os.path.join(CACHE_DIR, "mrms_precip_rate.grib2")
+CACHE_META_PATH = os.path.join(CACHE_DIR, "mrms_precip_rate.meta.json")
 PRECIP_THRESHOLD_MMHR = 0.1  # anything at/above this counts as "precip"
 BBOX_STEPS_DEG = [1, 2, 4, 8, 16, 30]  # progressively widen the search
 
@@ -87,25 +90,44 @@ def get_local_radar(lat, lon):
     }
 
 
-def fetch_mrms_precip_rate():
-    resp = requests.get(MRMS_URL, timeout=60)
-    resp.raise_for_status()
-    raw = gzip.decompress(resp.content)
-
-    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as f:
-        f.write(raw)
-        grib_path = f.name
-
+def load_cache_meta():
     try:
-        import cfgrib
+        with open(CACHE_META_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
 
-        ds = cfgrib.open_dataset(grib_path)
-        lats = ds.latitude.values
-        lons = ds.longitude.values  # 0-360
-        data = ds["unknown"].values  # mm/hr
-        valid_time = ds.valid_time.values
-    finally:
-        os.remove(grib_path)
+
+def fetch_mrms_precip_rate():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    meta = load_cache_meta()
+
+    headers = {}
+    if meta and os.path.exists(CACHE_GRIB_PATH):
+        headers["If-Modified-Since"] = meta["last_modified"]
+
+    resp = requests.get(MRMS_URL, headers=headers, timeout=60)
+    resp.raise_for_status()
+
+    if resp.status_code == 304:
+        print("NOAA has no newer data yet - using cached download.")
+        grib_path = CACHE_GRIB_PATH
+    else:
+        raw = gzip.decompress(resp.content)
+        with open(CACHE_GRIB_PATH, "wb") as f:
+            f.write(raw)
+        last_modified = resp.headers.get("Last-Modified")
+        with open(CACHE_META_PATH, "w") as f:
+            json.dump({"last_modified": last_modified}, f)
+        grib_path = CACHE_GRIB_PATH
+
+    import cfgrib
+
+    ds = cfgrib.open_dataset(grib_path)
+    lats = ds.latitude.values
+    lons = ds.longitude.values  # 0-360
+    data = ds["unknown"].values  # mm/hr
+    valid_time = ds.valid_time.values
 
     return lats, lons, data, valid_time
 
