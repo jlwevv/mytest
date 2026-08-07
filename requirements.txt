@@ -1,0 +1,5 @@
+requests>=2.28
+python-dotenv>=1.0
+numpy>=1.23
+cfgrib>=0.9
+eccodes>=1.6
