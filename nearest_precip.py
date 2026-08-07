@@ -50,6 +50,18 @@ IMPACT_MISS_THRESHOLD_KM = 15.0
 # the primary one, along the line it's moving away from.
 SECONDARY_SEARCH_HALF_ANGLE_DEG = 30.0
 
+MAP_ROWS = 23
+MAP_COLS = 45
+# mm/hr threshold, fill char, 256-color code - loosely mirrors the classic
+# green/yellow/orange/red/magenta NWS reflectivity color scale.
+MAP_LEVELS = [
+    (2.0, "░", 34),    # light - green
+    (6.0, "▒", 226),   # moderate - yellow
+    (12.0, "▓", 208),  # heavy - orange
+    (25.0, "█", 196),  # very heavy - red
+    (float("inf"), "█", 201),  # extreme - magenta
+]
+
 # distance is stored internally in km; "knots" isn't really a distance unit
 # (it's nautical miles per hour), but we treat it as shorthand for nautical
 # miles here since that's what people asking for knots actually want.
@@ -362,6 +374,72 @@ def find_precip_in_sector(lat, lon, lats, lons, data, center_bearing_deg, half_a
     return None
 
 
+def crop_grid(lat, lon, lats, lons, data, radius_km):
+    lon_360 = lon % 360
+    lat_buffer = (radius_km / KM_PER_DEG_LAT) * 1.5
+    lon_buffer = (radius_km / (KM_PER_DEG_LON_AT_EQUATOR * math.cos(math.radians(lat)))) * 1.5
+
+    lat_idx = np.where(np.abs(lats - lat) < lat_buffer)[0]
+    lon_idx = np.where(np.abs(lons - lon_360) < lon_buffer)[0]
+    return lats[lat_idx], lons[lon_idx], data[np.ix_(lat_idx, lon_idx)]
+
+
+def level_for_rate(rate_mmhr):
+    for threshold, char, color in MAP_LEVELS:
+        if rate_mmhr < threshold:
+            return char, color
+    return MAP_LEVELS[-1][1], MAP_LEVELS[-1][2]
+
+
+def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
+    radius_km = radius_miles * 1.60934
+    crop_lats, crop_lons, crop_data = crop_grid(lat, lon, lats, lons, data, radius_km)
+
+    row_center = MAP_ROWS // 2
+    col_center = MAP_COLS // 2
+    km_per_row = (2 * radius_km) / (MAP_ROWS - 1)
+    km_per_col = km_per_row / 2  # terminal chars are roughly twice as tall as wide
+
+    lines = [f"Radar mosaic within {radius_miles:.0f} mi of {lat:.4f}, {lon:.4f} (N up):"]
+    for r in range(MAP_ROWS):
+        dy_km = (row_center - r) * km_per_row
+        cell_lat = lat + dy_km / KM_PER_DEG_LAT
+        row_chars = []
+        for c in range(MAP_COLS):
+            if r == row_center and c == col_center:
+                row_chars.append("\x1b[1;97m@\x1b[0m")
+                continue
+
+            dx_km = (c - col_center) * km_per_col
+            cell_lon = lon + dx_km / (KM_PER_DEG_LON_AT_EQUATOR * math.cos(math.radians(lat)))
+            cell_lon_360 = cell_lon % 360
+
+            if crop_lats.size == 0 or crop_lons.size == 0:
+                row_chars.append(" ")
+                continue
+
+            lat_idx = np.argmin(np.abs(crop_lats - cell_lat))
+            lon_idx = np.argmin(np.abs(crop_lons - cell_lon_360))
+            rate = crop_data[lat_idx, lon_idx]
+
+            if rate <= NO_COVERAGE or rate < PRECIP_THRESHOLD_MMHR:
+                row_chars.append(" ")
+            else:
+                char, color = level_for_rate(rate)
+                row_chars.append(f"\x1b[38;5;{color}m{char}\x1b[0m")
+        lines.append("".join(row_chars))
+
+    lines.append(
+        "@ = you   "
+        "\x1b[38;5;34m░\x1b[0m light   "
+        "\x1b[38;5;226m▒\x1b[0m moderate   "
+        "\x1b[38;5;208m▓\x1b[0m heavy   "
+        "\x1b[38;5;196m█\x1b[0m very heavy   "
+        "\x1b[38;5;201m█\x1b[0m extreme"
+    )
+    return "\n".join(lines)
+
+
 def load_last_observation():
     try:
         with open(HISTORY_PATH) as f:
@@ -432,6 +510,10 @@ def main():
     parser = argparse.ArgumentParser(description="Find the closest active precipitation to a GPS point.")
     parser.add_argument("-v", "--verbose", action="store_true",
                          help="show download/cache/processing status and a download progress bar")
+    parser.add_argument("--map", action="store_true",
+                         help="draw an ANSI radar map centered on your point")
+    parser.add_argument("--map-radius", type=float, default=25.0,
+                         help="radius in miles for --map (default: 25)")
     args = parser.parse_args()
     VERBOSE = args.verbose
 
@@ -451,6 +533,11 @@ def main():
 
     lats, lons, data, valid_time = fetch_mrms_precip_rate()
     vprint(f"[process]  Mosaic valid: {valid_time}")
+
+    if args.map:
+        print()
+        print(render_ansi_map(lat, lon, lats, lons, data, args.map_radius))
+        print()
 
     prev = load_last_observation()
 
