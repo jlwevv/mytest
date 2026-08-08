@@ -401,6 +401,7 @@ def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
     km_per_col = km_per_row / 2  # terminal chars are roughly twice as tall as wide
 
     lines = [f"Radar mosaic within {radius_miles:.0f} mi of {lat:.4f}, {lon:.4f} (N up):"]
+    lines.append("┌" + "─" * MAP_COLS + "┐")
     for r in range(MAP_ROWS):
         dy_km = (row_center - r) * km_per_row
         cell_lat = lat + dy_km / KM_PER_DEG_LAT
@@ -427,8 +428,9 @@ def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
             else:
                 char, color = level_for_rate(rate)
                 row_chars.append(f"\x1b[38;5;{color}m{char}\x1b[0m")
-        lines.append("".join(row_chars))
+        lines.append("│" + "".join(row_chars) + "│")
 
+    lines.append("└" + "─" * MAP_COLS + "┘")
     lines.append(
         "@ = you   "
         "\x1b[38;5;34m░\x1b[0m light   "
