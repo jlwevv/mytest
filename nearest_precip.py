@@ -11,11 +11,18 @@ radar's raw feed directly.
 """
 
 import argparse
+import collections
+import copy
+import datetime
 import gzip
 import json
 import math
 import os
+import shutil
 import sys
+import textwrap
+import threading
+import time
 
 import numpy as np
 import requests
@@ -23,11 +30,23 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 VERBOSE = False
+APP_STATE = None  # set while running in --watch dashboard mode
 
 
 def vprint(msg):
     if VERBOSE:
         print(msg)
+
+
+def status(msg):
+    """Report a download/processing status message. In one-shot mode this is
+    just vprint (gated by --verbose); in --watch mode it goes into the
+    dashboard's activity log instead of stdout, since the screen is being
+    redrawn wholesale."""
+    if APP_STATE is not None:
+        APP_STATE.log(msg)
+    else:
+        vprint(msg)
 
 NWS_POINTS_URL = "https://api.weather.gov/points/{lat},{lon}"
 MRMS_URL = "https://mrms.ncep.noaa.gov/data/2D/PrecipRate/MRMS_PrecipRate.latest.grib2.gz"
@@ -61,6 +80,16 @@ MAP_LEVELS = [
     (25.0, "█", 196),  # very heavy - red
     (float("inf"), "█", 201),  # extreme - magenta
 ]
+
+DASHBOARD_MIN_COLS = 80
+DASHBOARD_MIN_ROWS = 50
+# Radar map on top, primary/secondary storm boxes side by side below it,
+# status bar across the bottom - each row of the layout sums to 80 cols.
+MAP_BOX_WIDTH = MAP_COLS + 2
+STORM_BOX_WIDTH = DASHBOARD_MIN_COLS // 2   # 40 + 40 = 80
+STORM_BOX_HEIGHT = 11
+STATUS_BOX_HEIGHT = 10
+STATUS_LOG_MAXLEN = 5
 
 # distance is stored internally in km; "knots" isn't really a distance unit
 # (it's nautical miles per hour), but we treat it as shorthand for nautical
@@ -173,17 +202,19 @@ def download_mrms(headers):
     if resp.status_code == 304:
         return 304, None, None
 
-    vprint("[download] New data available - downloading MRMS mosaic...")
+    status("[download] New data available - downloading MRMS mosaic...")
     total = int(resp.headers.get("Content-Length", 0))
     chunks = []
+    # A live tqdm bar would corrupt a full-screen --watch redraw, so it's
+    # only shown in one-shot --verbose mode.
     with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
-              desc="downloading", disable=not VERBOSE) as bar:
+              desc="downloading", disable=(APP_STATE is not None) or not VERBOSE) as bar:
         for chunk in resp.iter_content(chunk_size=64 * 1024):
             chunks.append(chunk)
             bar.update(len(chunk))
     compressed = b"".join(chunks)
 
-    vprint("[process]  Decompressing download...")
+    status("[process]  Decompressing download...")
     # NOAA overwrites the "latest" file in place (not an atomic swap), so a
     # download can occasionally straddle an update and land here truncated.
     raw = gzip.decompress(compressed)
@@ -198,26 +229,26 @@ def fetch_mrms_precip_rate():
     if meta and os.path.exists(CACHE_GRIB_PATH):
         headers["If-Modified-Since"] = meta["last_modified"]
 
-    vprint("[checking] Asking NOAA if the MRMS mosaic has updated...")
+    status("[checking] Asking NOAA if the MRMS mosaic has updated...")
 
     attempts = 3
     for attempt in range(1, attempts + 1):
         if attempt > 1:
-            vprint(f"[download] Retrying download (attempt {attempt}/{attempts})...")
+            status(f"[download] Retrying download (attempt {attempt}/{attempts})...")
         try:
-            status, raw, last_modified = download_mrms(headers)
+            http_status, raw, last_modified = download_mrms(headers)
             break
         except (requests.RequestException, gzip.BadGzipFile, EOFError) as exc:
-            vprint(f"[download] Download failed: {exc}")
+            status(f"[download] Download failed: {exc}")
             if attempt == attempts:
                 if os.path.exists(CACHE_GRIB_PATH):
-                    vprint("[cache]    Giving up - falling back to last good cached download.")
-                    status, raw, last_modified = 304, None, None
+                    status("[cache]    Giving up - falling back to last good cached download.")
+                    http_status, raw, last_modified = 304, None, None
                     break
                 sys.exit("Could not download MRMS data and no cached copy is available.")
 
-    if status == 304:
-        vprint("[cache]    No newer data yet - reusing cached download.")
+    if http_status == 304:
+        status("[cache]    No newer data yet - reusing cached download.")
         grib_path = CACHE_GRIB_PATH
     else:
         with open(CACHE_GRIB_PATH, "wb") as f:
@@ -226,7 +257,7 @@ def fetch_mrms_precip_rate():
             json.dump({"last_modified": last_modified}, f)
         grib_path = CACHE_GRIB_PATH
 
-    vprint("[process]  Parsing grib data locally...")
+    status("[process]  Parsing grib data locally...")
     import cfgrib
 
     ds = cfgrib.open_dataset(grib_path)
@@ -391,7 +422,21 @@ def level_for_rate(rate_mmhr):
     return MAP_LEVELS[-1][1], MAP_LEVELS[-1][2]
 
 
-def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
+def map_legend_line():
+    return (
+        "@ = you   "
+        "\x1b[38;5;34m░\x1b[0m light   "
+        "\x1b[38;5;226m▒\x1b[0m moderate   "
+        "\x1b[38;5;208m▓\x1b[0m heavy   "
+        "\x1b[38;5;196m█\x1b[0m very heavy   "
+        "\x1b[38;5;201m█\x1b[0m extreme"
+    )
+
+
+def build_map_box_lines(lat, lon, lats, lons, data, radius_miles):
+    """The bordered radar grid only (no title, no legend) - exactly
+    MAP_ROWS + 2 lines, so it can be lined up next to other fixed-height
+    boxes in the --watch dashboard layout."""
     radius_km = radius_miles * 1.60934
     crop_lats, crop_lons, crop_data = crop_grid(lat, lon, lats, lons, data, radius_km)
 
@@ -400,8 +445,7 @@ def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
     km_per_row = (2 * radius_km) / (MAP_ROWS - 1)
     km_per_col = km_per_row / 2  # terminal chars are roughly twice as tall as wide
 
-    lines = [f"Radar mosaic within {radius_miles:.0f} mi of {lat:.4f}, {lon:.4f} (N up):"]
-    lines.append("┌" + "─" * MAP_COLS + "┐")
+    lines = ["┌" + "─" * MAP_COLS + "┐"]
     for r in range(MAP_ROWS):
         dy_km = (row_center - r) * km_per_row
         cell_lat = lat + dy_km / KM_PER_DEG_LAT
@@ -431,15 +475,36 @@ def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
         lines.append("│" + "".join(row_chars) + "│")
 
     lines.append("└" + "─" * MAP_COLS + "┘")
-    lines.append(
-        "@ = you   "
-        "\x1b[38;5;34m░\x1b[0m light   "
-        "\x1b[38;5;226m▒\x1b[0m moderate   "
-        "\x1b[38;5;208m▓\x1b[0m heavy   "
-        "\x1b[38;5;196m█\x1b[0m very heavy   "
-        "\x1b[38;5;201m█\x1b[0m extreme"
-    )
+    return lines
+
+
+def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
+    lines = [f"Radar mosaic within {radius_miles:.0f} mi of {lat:.4f}, {lon:.4f} (N up):"]
+    lines.extend(build_map_box_lines(lat, lon, lats, lons, data, radius_miles))
+    lines.append(map_legend_line())
     return "\n".join(lines)
+
+
+def make_box(title, content_lines, width, height):
+    """Render a bordered box of an exact width/height (borders included).
+    Text lines are word-wrapped to fit and truncated/padded with blanks to
+    fit the fixed height, so boxes always line up in the dashboard grid."""
+    interior_w = width - 2
+    interior_h = height - 2
+
+    body = [title.ljust(interior_w)[:interior_w], "-" * interior_w]
+    for line in content_lines:
+        body.extend(textwrap.wrap(line, interior_w) or [""])
+
+    body = body[:interior_h]
+    while len(body) < interior_h:
+        body.append("")
+
+    box = ["┌" + "─" * interior_w + "┐"]
+    for line in body:
+        box.append("│" + line.ljust(interior_w)[:interior_w] + "│")
+    box.append("└" + "─" * interior_w + "┘")
+    return box
 
 
 def load_last_observation():
@@ -507,6 +572,253 @@ def analyze_movement(prev, lat, lon, hit, valid_time):
     }
 
 
+class AppState:
+    """Shared between the background fetch/analysis thread and the render
+    loop. All reads/writes go through the lock; render() takes a shallow
+    snapshot so it never blocks the worker mid-cycle."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.busy = True
+        self.log_entries = collections.deque(maxlen=STATUS_LOG_MAXLEN)
+        self.last_checked = None
+        self.last_updated = None  # radar mosaic's own valid_time
+        self.next_check_at = None
+        self.error = None
+
+        self.lats = None
+        self.lons = None
+        self.data = None
+        self.hit = None
+        self.movement = None
+        self.primary_track = None      # (will_impact: bool, description: str)
+        self.secondary = None
+        self.secondary_track = None    # description: str
+
+    def log(self, message):
+        with self.lock:
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.log_entries.append(f"{timestamp} {message}")
+
+    def set_busy(self, busy):
+        with self.lock:
+            self.busy = busy
+
+    def set_next_check(self, ts):
+        with self.lock:
+            self.next_check_at = ts
+
+    def set_error(self, message):
+        with self.lock:
+            self.error = message
+
+    def update_result(self, **fields):
+        with self.lock:
+            for key, value in fields.items():
+                setattr(self, key, value)
+            self.last_checked = datetime.datetime.now()
+            self.error = None
+
+    def snapshot(self):
+        with self.lock:
+            return copy.copy(self)
+
+
+def run_analysis_cycle(state, lat, lon, units, rate_units):
+    lats, lons, data, valid_time = fetch_mrms_precip_rate()
+
+    prev = load_last_observation()
+    hit = find_nearest_precip(lat, lon, lats, lons, data)
+    movement = None
+    primary_track = None
+    secondary = None
+    secondary_track = None
+
+    if hit is not None:
+        movement = analyze_movement(prev, lat, lon, hit, valid_time)
+        if movement is not None:
+            t_hours, miss_km = project_track(
+                hit["lat"], hit["lon"], lat, lon, movement["bearing_deg"], movement["speed_kmh"]
+            )
+            will_impact, track_desc = describe_track(t_hours, miss_km, units)
+            primary_track = (will_impact, track_desc)
+
+            if not will_impact:
+                search_bearing = (movement["bearing_deg"] + 180) % 360
+                secondary = find_precip_in_sector(
+                    lat, lon, lats, lons, data,
+                    search_bearing, SECONDARY_SEARCH_HALF_ANGLE_DEG,
+                    hit["lat"], hit["lon"],
+                )
+                if secondary is not None:
+                    t2_hours, miss2_km = project_track(
+                        secondary["lat"], secondary["lon"], lat, lon,
+                        movement["bearing_deg"], movement["speed_kmh"],
+                    )
+                    _, secondary_track = describe_track(t2_hours, miss2_km, units)
+
+        save_observation(lat, lon, hit, valid_time)
+
+    state.update_result(
+        lats=lats, lons=lons, data=data,
+        hit=hit, movement=movement, primary_track=primary_track,
+        secondary=secondary, secondary_track=secondary_track,
+        last_updated=valid_time,
+    )
+
+
+def worker_loop(state, lat, lon, units, rate_units, interval_seconds):
+    while not state.stop_event.is_set():
+        state.set_busy(True)
+        try:
+            run_analysis_cycle(state, lat, lon, units, rate_units)
+        except Exception as exc:  # keep the dashboard alive on transient errors
+            state.set_error(str(exc))
+            state.log(f"[error] {exc}")
+        state.set_busy(False)
+        state.set_next_check(time.time() + interval_seconds)
+        state.stop_event.wait(interval_seconds)
+
+
+def build_primary_box_lines(units, rate_units, snapshot):
+    if snapshot.hit is None:
+        return make_box("PRIMARY STORM", ["No precipitation detected in range."],
+                         STORM_BOX_WIDTH, STORM_BOX_HEIGHT)
+
+    hit = snapshot.hit
+    distance, unit_label = convert_distance(hit["distance_km"], units)
+    rate, rate_label = convert_rate(hit["rate_mmhr"], rate_units)
+    lines = [
+        f"{distance:.1f} {unit_label} {hit['bearing']} of you",
+        f"Pos {hit['lat']:.3f}, {hit['lon']:.3f}",
+        f"Rate {rate:.2f} {rate_label}",
+    ]
+    if snapshot.movement is None:
+        lines.append("Movement: gathering history...")
+    else:
+        speed, speed_label = convert_speed(snapshot.movement["speed_kmh"], units)
+        lines.append(f"Heading {snapshot.movement['bearing_deg']:.0f} deg @ {speed:.1f} {speed_label}")
+        if snapshot.primary_track is not None:
+            lines.append(f"Track: {snapshot.primary_track[1]}")
+    return make_box("PRIMARY STORM", lines, STORM_BOX_WIDTH, STORM_BOX_HEIGHT)
+
+
+def build_secondary_box_lines(units, rate_units, snapshot):
+    if snapshot.primary_track is not None and snapshot.primary_track[0]:
+        lines = ["Primary storm is on track -", "no need to look for a trailing one."]
+    elif snapshot.secondary is None:
+        lines = ["None found upstream of the", "primary storm's track."]
+    else:
+        sec = snapshot.secondary
+        sdist, sunit = convert_distance(sec["distance_km"], units)
+        srate, sratelabel = convert_rate(sec["rate_mmhr"], rate_units)
+        lines = [
+            f"{sdist:.1f} {sunit} {sec['bearing']} of you",
+            f"Pos {sec['lat']:.3f}, {sec['lon']:.3f}",
+            f"Rate {srate:.2f} {sratelabel}",
+            "(assumes primary's heading/speed)",
+        ]
+        if snapshot.secondary_track:
+            lines.append(f"Track: {snapshot.secondary_track}")
+    return make_box("SECONDARY STORM", lines, STORM_BOX_WIDTH, STORM_BOX_HEIGHT)
+
+
+def next_check_text(snapshot, interval_seconds):
+    if snapshot.busy:
+        return "checking now..."
+    if snapshot.next_check_at is None:
+        return f"next check in {interval_seconds:.0f}s"
+    next_in = max(0, int(snapshot.next_check_at - time.time()))
+    return f"next check in {next_in}s"
+
+
+def build_status_box_lines(radar_info, interval_seconds, snapshot, width, height):
+    last_checked = snapshot.last_checked.strftime("%H:%M:%S") if snapshot.last_checked else "-"
+    last_updated = str(snapshot.last_updated) if snapshot.last_updated is not None else "-"
+
+    lines = [
+        f"Radar: {radar_info.get('radar_station')} (WFO {radar_info.get('forecast_office')}) "
+        f"near {radar_info.get('city')}, {radar_info.get('state')}",
+        f"Last checked {last_checked}   Radar scan valid {last_updated}",
+        "Status: " + next_check_text(snapshot, interval_seconds),
+    ]
+    if snapshot.error:
+        lines.append(f"Last error: {snapshot.error}")
+    lines.append("Recent activity:")
+    if snapshot.log_entries:
+        lines.extend(snapshot.log_entries)
+    else:
+        lines.append("(nothing logged yet)")
+    return make_box("STATUS", lines, width, height)
+
+
+def build_frame(lat, lon, units, rate_units, radar_info, map_radius, interval_seconds, snapshot):
+    header = (
+        f" NEAREST PRECIP MONITOR - {lat:.4f}, {lon:.4f} - "
+        f"{next_check_text(snapshot, interval_seconds)} "
+    )
+    lines = [header.center(DASHBOARD_MIN_COLS, "=")]
+
+    if snapshot.lats is None:
+        map_box = make_box(
+            f"RADAR ({map_radius:.0f} mi, N up)", ["Waiting for first radar fetch..."],
+            MAP_BOX_WIDTH, MAP_ROWS + 2,
+        )
+    else:
+        map_box = build_map_box_lines(lat, lon, snapshot.lats, snapshot.lons, snapshot.data, map_radius)
+
+    # Radar map on top, centered in the 80-col frame.
+    map_indent = " " * ((DASHBOARD_MIN_COLS - MAP_BOX_WIDTH) // 2)
+    lines.extend(map_indent + line for line in map_box)
+    lines.append(map_indent + map_legend_line() if snapshot.lats is not None else "")
+    lines.append("")
+
+    # Primary and secondary storm boxes side by side below the map.
+    primary_box = build_primary_box_lines(units, rate_units, snapshot)
+    secondary_box = build_secondary_box_lines(units, rate_units, snapshot)
+    for left, right in zip(primary_box, secondary_box):
+        lines.append(left + right)
+    lines.append("")
+
+    # Status bar across the full width at the bottom.
+    lines.extend(build_status_box_lines(radar_info, interval_seconds, snapshot, DASHBOARD_MIN_COLS, STATUS_BOX_HEIGHT))
+    return "\n".join(lines)
+
+
+def run_dashboard(lat, lon, units, rate_units, radar_info, map_radius, interval_seconds):
+    term_size = shutil.get_terminal_size(fallback=(DASHBOARD_MIN_COLS, DASHBOARD_MIN_ROWS))
+    if term_size.columns < DASHBOARD_MIN_COLS or term_size.lines < DASHBOARD_MIN_ROWS:
+        print(
+            f"Warning: terminal is {term_size.columns}x{term_size.lines}, "
+            f"this dashboard is designed for at least {DASHBOARD_MIN_COLS}x{DASHBOARD_MIN_ROWS}."
+        )
+
+    state = AppState()
+    global APP_STATE
+    APP_STATE = state
+
+    worker = threading.Thread(
+        target=worker_loop, args=(state, lat, lon, units, rate_units, interval_seconds), daemon=True
+    )
+    worker.start()
+
+    try:
+        print("\x1b[?25l", end="")  # hide cursor
+        while True:
+            snapshot = state.snapshot()
+            frame = build_frame(lat, lon, units, rate_units, radar_info, map_radius, interval_seconds, snapshot)
+            print("\x1b[H\x1b[J" + frame, end="", flush=True)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        state.stop_event.set()
+        worker.join(timeout=5)
+        print("\x1b[?25h")  # restore cursor
+        print("\nStopped.")
+
+
 def main():
     global VERBOSE
     parser = argparse.ArgumentParser(description="Find the closest active precipitation to a GPS point.")
@@ -516,6 +828,10 @@ def main():
                          help="draw an ANSI radar map centered on your point")
     parser.add_argument("--map-radius", type=float, default=25.0,
                          help="radius in miles for --map (default: 25)")
+    parser.add_argument("--watch", action="store_true",
+                         help="run as a continuously-updating full-screen dashboard")
+    parser.add_argument("--interval", type=float, default=60.0,
+                         help="seconds between radar checks in --watch mode (default: 60)")
     args = parser.parse_args()
     VERBOSE = args.verbose
 
@@ -531,7 +847,12 @@ def main():
             f"(WFO {radar['forecast_office']}, near {radar['city']}, {radar['state']})"
         )
     except requests.RequestException as exc:
+        radar = {"radar_station": "?", "forecast_office": "?", "city": "?", "state": "?"}
         print(f"Could not look up local radar station: {exc}")
+
+    if args.watch:
+        run_dashboard(lat, lon, units, rate_units, radar, args.map_radius, args.interval)
+        return
 
     lats, lons, data, valid_time = fetch_mrms_precip_rate()
     vprint(f"[process]  Mosaic valid: {valid_time}")
