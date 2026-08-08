@@ -266,7 +266,8 @@ def fetch_mrms_precip_rate():
     data = ds["unknown"].values  # mm/hr
     valid_time = ds.valid_time.values
 
-    return lats, lons, data, valid_time
+    is_new = http_status != 304
+    return lats, lons, data, valid_time, is_new
 
 
 def haversine_km(lat0, lon0, lats, lons):
@@ -620,13 +621,27 @@ class AppState:
             self.last_checked = datetime.datetime.now()
             self.error = None
 
+    def mark_checked(self):
+        """A check ran but there was no new radar scan - record that we
+        checked without touching the existing hit/movement results."""
+        with self.lock:
+            self.last_checked = datetime.datetime.now()
+            self.error = None
+
     def snapshot(self):
         with self.lock:
             return copy.copy(self)
 
 
 def run_analysis_cycle(state, lat, lon, units, rate_units):
-    lats, lons, data, valid_time = fetch_mrms_precip_rate()
+    lats, lons, data, valid_time, is_new = fetch_mrms_precip_rate()
+
+    if not is_new:
+        # No new radar scan since last check - leave the existing hit/movement
+        # results alone rather than recomputing (and rewriting history) off
+        # data that hasn't changed.
+        state.mark_checked()
+        return
 
     prev = load_last_observation()
     hit = find_nearest_precip(lat, lon, lats, lons, data)
@@ -854,7 +869,7 @@ def main():
         run_dashboard(lat, lon, units, rate_units, radar, args.map_radius, args.interval)
         return
 
-    lats, lons, data, valid_time = fetch_mrms_precip_rate()
+    lats, lons, data, valid_time, _is_new = fetch_mrms_precip_rate()
     vprint(f"[process]  Mosaic valid: {valid_time}")
 
     if args.map:
