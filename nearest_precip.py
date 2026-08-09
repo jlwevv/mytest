@@ -622,7 +622,7 @@ def _nearest_index_map(old_coords, new_coords):
     return idx
 
 
-def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key, forecast_min):
+def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key):
     """Estimate the precip field's dominant motion near (lat, lon) by phase-
     correlating the oldest cached frame in the lookback window against the
     freshest one. Using the oldest-vs-newest pair (rather than chaining
@@ -647,7 +647,14 @@ def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key, fo
         remapped[np.ix_(lat_map, lon_map)] = data_old
         data_old, lats_old, lons_old = remapped, lats, lons
 
-    crop_radius_km = (forecast_min / 60.0) * MAX_STORM_SPEED_KMH_ASSUMPTION * CROP_RADIUS_BUFFER
+    # Sized to how far a storm could plausibly have moved in the interval
+    # actually being compared (elapsed_hours) - NOT the forecast horizon.
+    # A crop sized off forecast_min can span 150-200+ km, which on an active
+    # day easily contains multiple independently-moving storm cells; the
+    # whole-field correlation then locks onto whichever motion is most
+    # spatially coherent across that huge area rather than the cell that's
+    # actually near (lat, lon).
+    crop_radius_km = elapsed_hours * MAX_STORM_SPEED_KMH_ASSUMPTION * CROP_RADIUS_BUFFER
     crop_lats, crop_lons, crop_new = crop_grid(lat, lon, lats, lons, data, crop_radius_km)
     _, _, crop_old = crop_grid(lat, lon, lats_old, lons_old, data_old, crop_radius_km)
 
@@ -664,9 +671,15 @@ def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key, fo
     def _prep(field):
         return np.clip(np.where(field <= NO_COVERAGE, 0.0, field), 0.0, None)
 
-    fa = np.fft.fft2(_prep(crop_old))
-    fb = np.fft.fft2(_prep(crop_new))
-    cross = fa * np.conj(fb)
+    # Taper the crop edges to zero before the FFT. Without this, the hard
+    # rectangular cut at the crop boundary leaks spectral energy across many
+    # frequencies ("spectral leakage"), which phase correlation is very
+    # sensitive to - the estimated peak can swing wildly (by 100+ degrees)
+    # for crop-radius changes of just a few km. A window fixes that.
+    window = np.outer(np.hanning(crop_old.shape[0]), np.hanning(crop_old.shape[1]))
+    fa = np.fft.fft2(_prep(crop_old) * window)
+    fb = np.fft.fft2(_prep(crop_new) * window)
+    cross = fb * np.conj(fa)
     magnitude = np.abs(cross)
     cross = np.divide(cross, magnitude, out=np.zeros_like(cross), where=magnitude > 1e-9)
     corr = np.abs(np.fft.ifft2(cross))
@@ -765,7 +778,7 @@ def summarize_rain_forecast(series, threshold_mmhr=PRECIP_THRESHOLD_MMHR):
 def compute_rain_forecast(cfg, lats, lons, data, valid_time, frames):
     oldest_key = frames[0]["key"] if len(frames) > 1 else None
     motion = estimate_motion_field(
-        cfg.lat, cfg.lon, lats, lons, data, valid_time, oldest_key, cfg.forecast_min
+        cfg.lat, cfg.lon, lats, lons, data, valid_time, oldest_key
     )
 
     lat_idx = np.argmin(np.abs(lats - cfg.lat))
