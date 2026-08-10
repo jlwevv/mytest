@@ -80,6 +80,12 @@ CROP_RADIUS_BUFFER = 1.3
 # velocity - require at least this many above-threshold cells in a frame
 # before trusting a motion estimate derived from it.
 MIN_SIGNAL_CELLS = 25
+# TREC-style local block correlation (see estimate_motion_field): rather than
+# one whole-field correlation - which can lock onto a distant, unrelated
+# storm cell if one falls inside the crop - several small blocks clustered
+# around the point are each correlated independently and combined.
+BLOCK_OFFSET_FRACTION = 0.5  # side-block offset from center, as a fraction of crop_radius_km
+BLOCK_OFFSET_BEARINGS_DEG = (0.0, 90.0, 180.0, 270.0)  # N, E, S, W side blocks around the center
 FORECAST_STEP_MIN = 2.0  # matches MRMS cadence
 
 MAP_ROWS = 23
@@ -198,6 +204,17 @@ def format_duration(hours):
 
 def format_eta_minutes(minutes):
     return format_duration(minutes / 60.0)
+
+
+def clock_time_str(base_utc, minutes):
+    """Format base_utc + minutes as a local clock time, e.g. '3:45 PM'."""
+    target = base_utc + datetime.timedelta(minutes=minutes)
+    return target.astimezone().strftime("%-I:%M %p")
+
+
+def format_eta(base_utc, minutes):
+    """'~45 min (3:45 PM)' - duration plus the local clock time it lands on."""
+    return f"{format_eta_minutes(minutes)} ({clock_time_str(base_utc, minutes)})"
 
 
 def get_local_radar(lat, lon):
@@ -622,41 +639,16 @@ def _nearest_index_map(old_coords, new_coords):
     return idx
 
 
-def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key):
-    """Estimate the precip field's dominant motion near (lat, lon) by phase-
-    correlating the oldest cached frame in the lookback window against the
-    freshest one. Using the oldest-vs-newest pair (rather than chaining
-    consecutive 2-minute frames) gives a more stable displacement estimate
-    over the whole window, and needs no per-cell identity tracking - it's a
-    whole-field correlation, immune to a different cell simply popping up
-    closer between scans."""
-    if oldest_key is None:
-        return None
-
-    lats_old, lons_old, data_old, valid_time_old = open_frame(oldest_key)
-    utc_new = to_utc_datetime(valid_time)
-    utc_old = to_utc_datetime(valid_time_old)
-    elapsed_hours = (utc_new - utc_old).total_seconds() / 3600.0
-    if elapsed_hours <= 0:
-        return None
-
-    if not (np.array_equal(lats_old, lats) and np.array_equal(lons_old, lons)):
-        lat_map = _nearest_index_map(lats_old, lats)
-        lon_map = _nearest_index_map(lons_old, lons)
-        remapped = np.full((lats.size, lons.size), NO_COVERAGE, dtype=data_old.dtype)
-        remapped[np.ix_(lat_map, lon_map)] = data_old
-        data_old, lats_old, lons_old = remapped, lats, lons
-
-    # Sized to how far a storm could plausibly have moved in the interval
-    # actually being compared (elapsed_hours) - NOT the forecast horizon.
-    # A crop sized off forecast_min can span 150-200+ km, which on an active
-    # day easily contains multiple independently-moving storm cells; the
-    # whole-field correlation then locks onto whichever motion is most
-    # spatially coherent across that huge area rather than the cell that's
-    # actually near (lat, lon).
-    crop_radius_km = elapsed_hours * MAX_STORM_SPEED_KMH_ASSUMPTION * CROP_RADIUS_BUFFER
-    crop_lats, crop_lons, crop_new = crop_grid(lat, lon, lats, lons, data, crop_radius_km)
-    _, _, crop_old = crop_grid(lat, lon, lats_old, lons_old, data_old, crop_radius_km)
+def _estimate_block_motion(lat_c, lon_c, lats, lons, data, lats_old, lons_old, data_old,
+                            elapsed_hours, crop_radius_km):
+    """One local block's motion vector, centered at (lat_c, lon_c), via
+    windowed FFT phase correlation between the old/new frames (already
+    grid-aligned by the caller). Returns {"bearing_deg", "speed_kmh",
+    "signal_cells"}, or None on insufficient signal, an empty/mismatched
+    crop (e.g. the block fell outside radar coverage), or an implausibly
+    fast result."""
+    crop_lats, crop_lons, crop_new = crop_grid(lat_c, lon_c, lats, lons, data, crop_radius_km)
+    _, _, crop_old = crop_grid(lat_c, lon_c, lats_old, lons_old, data_old, crop_radius_km)
 
     if crop_new.shape != crop_old.shape or crop_new.size == 0:
         return None
@@ -693,7 +685,7 @@ def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key):
         return None
     km_per_row = abs(float(np.mean(np.diff(crop_lats)))) * KM_PER_DEG_LAT
     km_per_col = abs(float(np.mean(np.diff(crop_lons)))) * KM_PER_DEG_LON_AT_EQUATOR * math.cos(
-        math.radians(lat)
+        math.radians(lat_c)
     )
 
     # Row index increases whichever way `lats` runs (ascending or
@@ -705,7 +697,7 @@ def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key):
 
     displacement_km = math.hypot(dx_km, dy_km)
     if displacement_km < NOISE_FLOOR_KM:
-        return {"bearing_deg": 0.0, "speed_kmh": 0.0, "elapsed_hours": elapsed_hours}
+        return {"bearing_deg": 0.0, "speed_kmh": 0.0, "signal_cells": signal_cells}
 
     speed_kmh = displacement_km / elapsed_hours
     if speed_kmh > MAX_STORM_SPEED_KMH_ASSUMPTION:
@@ -716,6 +708,95 @@ def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key):
         return None
 
     bearing_deg = (math.degrees(math.atan2(dx_km, dy_km)) + 360) % 360
+    return {"bearing_deg": bearing_deg, "speed_kmh": speed_kmh, "signal_cells": signal_cells}
+
+
+def _combine_block_motions(block_results):
+    """Combine several block motion vectors (each {"bearing_deg",
+    "speed_kmh", "signal_cells"}), weighted by signal_cells, into one
+    (bearing_deg, speed_kmh). Bearing is circular - averaging degrees
+    directly would make 350 deg and 10 deg average to 180 deg instead of
+    ~0 deg - so combination happens in Cartesian (vx, vy) space. Caller
+    guarantees block_results is non-empty.
+
+    The combined speed can never exceed MAX_STORM_SPEED_KMH_ASSUMPTION
+    without an explicit check: by the triangle inequality, the magnitude of
+    a weighted average of vectors is at most the weighted average of their
+    magnitudes, and every contributing block already satisfies that cap."""
+    vx_sum = vy_sum = weight_sum = 0.0
+    for r in block_results:
+        w = r["signal_cells"]
+        rad = math.radians(r["bearing_deg"])
+        vx_sum += w * r["speed_kmh"] * math.sin(rad)
+        vy_sum += w * r["speed_kmh"] * math.cos(rad)
+        weight_sum += w
+
+    vx, vy = vx_sum / weight_sum, vy_sum / weight_sum
+    speed_kmh = math.hypot(vx, vy)
+    if speed_kmh < 1e-9:
+        return 0.0, 0.0
+    return (math.degrees(math.atan2(vx, vy)) + 360) % 360, speed_kmh
+
+
+def estimate_motion_field(lat, lon, lats, lons, data, valid_time, oldest_key):
+    """Estimate the precip field's dominant motion near (lat, lon) using a
+    TREC-style cluster of small local blocks (the point itself plus 4
+    cardinal offsets) rather than one whole-field correlation. A single
+    whole-field correlation over a crop wide enough to be useful can lock
+    onto a distant, unrelated storm cell if one falls inside it; several
+    small blocks clustered tightly around the point dilute that risk by
+    construction, since a contaminating cell is unlikely to dominate more
+    than one or two of them. Each block is phase-correlated between the
+    oldest cached frame in the lookback window and the freshest one (rather
+    than chaining consecutive 2-minute frames, which gives a more stable
+    displacement estimate over the whole window and needs no per-cell
+    identity tracking)."""
+    if oldest_key is None:
+        return None
+
+    lats_old, lons_old, data_old, valid_time_old = open_frame(oldest_key)
+    utc_new = to_utc_datetime(valid_time)
+    utc_old = to_utc_datetime(valid_time_old)
+    elapsed_hours = (utc_new - utc_old).total_seconds() / 3600.0
+    if elapsed_hours <= 0:
+        return None
+
+    if not (np.array_equal(lats_old, lats) and np.array_equal(lons_old, lons)):
+        lat_map = _nearest_index_map(lats_old, lats)
+        lon_map = _nearest_index_map(lons_old, lons)
+        remapped = np.full((lats.size, lons.size), NO_COVERAGE, dtype=data_old.dtype)
+        remapped[np.ix_(lat_map, lon_map)] = data_old
+        data_old, lats_old, lons_old = remapped, lats, lons
+
+    # Sized to how far a storm could plausibly have moved in the interval
+    # actually being compared (elapsed_hours) - NOT the forecast horizon.
+    # A crop sized off forecast_min can span 150-200+ km, which on an active
+    # day easily contains multiple independently-moving storm cells.
+    crop_radius_km = elapsed_hours * MAX_STORM_SPEED_KMH_ASSUMPTION * CROP_RADIUS_BUFFER
+
+    offset_km = crop_radius_km * BLOCK_OFFSET_FRACTION
+    lon_km_per_deg = KM_PER_DEG_LON_AT_EQUATOR * math.cos(math.radians(lat))
+    block_centers = [(lat, lon)]
+    for bearing_deg in BLOCK_OFFSET_BEARINGS_DEG:
+        bearing_rad = math.radians(bearing_deg)
+        block_centers.append((
+            lat + (offset_km * math.cos(bearing_rad)) / KM_PER_DEG_LAT,
+            lon + (offset_km * math.sin(bearing_rad)) / lon_km_per_deg,
+        ))
+
+    block_results = []
+    for lat_c, lon_c in block_centers:
+        result = _estimate_block_motion(
+            lat_c, lon_c, lats, lons, data, lats_old, lons_old, data_old,
+            elapsed_hours, crop_radius_km,
+        )
+        if result is not None:
+            block_results.append(result)
+
+    if not block_results:
+        return None
+
+    bearing_deg, speed_kmh = _combine_block_motions(block_results)
     return {"bearing_deg": bearing_deg, "speed_kmh": speed_kmh, "elapsed_hours": elapsed_hours}
 
 
@@ -980,19 +1061,20 @@ def build_rain_status_box_lines(snapshot):
                          STORM_BOX_WIDTH, STORM_BOX_HEIGHT)
 
     forecast = snapshot.forecast
+    base_utc = to_utc_datetime(snapshot.last_updated)
     lines = ["Raining now at your location." if forecast["raining_now"]
              else "Not raining at your location."]
 
     if forecast["start_min"] is None:
         lines.append("No rain expected in the forecast window.")
     elif forecast["start_min"] > 0:
-        lines.append(f"Rain starts in ~{format_eta_minutes(forecast['start_min'])}.")
+        lines.append(f"Rain starts in ~{format_eta(base_utc, forecast['start_min'])}.")
 
     if forecast["start_min"] is not None:
         if forecast["end_min"] is None:
             lines.append("No clear end within the forecast window.")
         else:
-            lines.append(f"Rain ends in ~{format_eta_minutes(forecast['end_min'])}.")
+            lines.append(f"Rain ends in ~{format_eta(base_utc, forecast['end_min'])}.")
 
     return make_box("RAIN STATUS", lines, STORM_BOX_WIDTH, STORM_BOX_HEIGHT)
 
@@ -1156,6 +1238,7 @@ def main():
 
     forecast = result["forecast"]
     motion = result["motion"]
+    base_utc = to_utc_datetime(result["valid_time"])
 
     print("Status: Raining now at your location." if forecast["raining_now"]
           else "Status: Not raining at your location.")
@@ -1163,13 +1246,13 @@ def main():
     if forecast["start_min"] is None:
         print(f"Forecast: no rain expected in the next {format_eta_minutes(cfg.forecast_min)}.")
     elif forecast["start_min"] > 0:
-        print(f"Forecast: rain starts in ~{format_eta_minutes(forecast['start_min'])}.")
+        print(f"Forecast: rain starts in ~{format_eta(base_utc, forecast['start_min'])}.")
 
     if forecast["start_min"] is not None:
         if forecast["end_min"] is None:
             print(f"Forecast: no clear end within the {format_eta_minutes(cfg.forecast_min)} window.")
         else:
-            print(f"Forecast: rain ends in ~{format_eta_minutes(forecast['end_min'])}.")
+            print(f"Forecast: rain ends in ~{format_eta(base_utc, forecast['end_min'])}.")
 
     if motion is None:
         print("Motion: not enough radar history or nearby precip signal yet.")
