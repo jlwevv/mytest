@@ -15,10 +15,12 @@ depart from the point itself.
 import argparse
 import collections
 import copy
+import csv
 import dataclasses
 import datetime
 import glob
 import gzip
+import io
 import json
 import math
 import os
@@ -28,6 +30,7 @@ import sys
 import textwrap
 import threading
 import time
+import zipfile
 
 import numpy as np
 import requests
@@ -63,6 +66,12 @@ CACHE_GRIB_PATH = os.path.join(CACHE_DIR, "mrms_precip_rate.grib2")
 CACHE_META_PATH = os.path.join(CACHE_DIR, "mrms_precip_rate.meta.json")
 FRAMES_DIR = os.path.join(CACHE_DIR, "frames")
 FRAMES_INDEX_PATH = os.path.join(CACHE_DIR, "frames_index.json")
+# GeoNames' free static bulk-download dump (distinct from their rate-limited/
+# signup-gated live API) - all populated places worldwide with population
+# >= 1000. Downloaded once and cached forever; it's static reference data.
+CITY_DATA_URL = "https://download.geonames.org/export/dump/cities1000.zip"
+CITY_DATA_ZIP_MEMBER = "cities1000.txt"
+CITY_DATA_CACHE_PATH = os.path.join(CACHE_DIR, "cities1000.txt")
 FRAME_INTERVAL_MIN = 2.0  # MRMS's native publishing cadence
 FRAME_PRUNE_BUFFER_MIN = 10.0  # keep a little past the lookback window before deleting
 PRECIP_THRESHOLD_MMHR = 0.1  # anything at/above this counts as "precip"
@@ -102,13 +111,20 @@ MAP_LEVELS = [
 
 DASHBOARD_MIN_COLS = 80
 DASHBOARD_MIN_ROWS = 50
-# Radar map on top, rain status / storm motion boxes side by side below it,
-# status bar across the bottom - each row of the layout sums to 80 cols.
+# Radar map + town legend side by side on top, rain status / storm motion
+# boxes side by side below that, status bar across the bottom - each row of
+# the layout sums to 80 cols.
 MAP_BOX_WIDTH = MAP_COLS + 2
+CITY_LEGEND_BOX_WIDTH = DASHBOARD_MIN_COLS - MAP_BOX_WIDTH   # 47 + 33 = 80
 STORM_BOX_WIDTH = DASHBOARD_MIN_COLS // 2   # 40 + 40 = 80
 STORM_BOX_HEIGHT = 11
 STATUS_BOX_HEIGHT = 10
 STATUS_LOG_MAXLEN = 5
+# Map overlay of nearby towns, numbered 1-9 (a single digit is the display
+# budget) by descending population, skipping any candidate too close to an
+# already-picked (usually larger) town so clustered suburbs collapse to one.
+MAX_CITY_MARKERS = 9
+MIN_CITY_SEPARATION_MI = 3.0
 
 # distance is stored internally in km; "knots" isn't really a distance unit
 # (it's nautical miles per hour), but we treat it as shorthand for nautical
@@ -139,6 +155,7 @@ class Config:
     rate_units: str
     lookback_min: float
     forecast_min: float
+    city_min_population: float
 
 
 def _positive_float(name, default):
@@ -175,8 +192,9 @@ def load_config():
 
     lookback_min = _positive_float("LOOKBACK_MIN", 30.0)
     forecast_min = _positive_float("FORECAST_MIN", 90.0)
+    city_min_population = _positive_float("CITY_MIN_POPULATION", 1000.0)
 
-    return Config(lat, lon, units, rate_units, lookback_min, forecast_min)
+    return Config(lat, lon, units, rate_units, lookback_min, forecast_min, city_min_population)
 
 
 def convert_distance(distance_km, units):
@@ -361,6 +379,105 @@ def crop_grid(lat, lon, lats, lons, data, radius_km):
     return lats[lat_idx], lons[lon_idx], data[np.ix_(lat_idx, lon_idx)]
 
 
+def ensure_city_data():
+    """Download+cache GeoNames' free static cities1000 bulk dump (name/lat/
+    lon/population/admin, worldwide, population >= 1000) if not already
+    cached. It's static reference data, not something that changes run to
+    run like radar, so a simple exists-check is enough - no re-fetch logic."""
+    if os.path.exists(CITY_DATA_CACHE_PATH):
+        return CITY_DATA_CACHE_PATH
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    status("[download] Fetching town/city reference data (one-time)...")
+    resp = requests.get(CITY_DATA_URL, stream=True, timeout=60)
+    resp.raise_for_status()
+    total = int(resp.headers.get("Content-Length", 0))
+    chunks = []
+    with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
+              desc="downloading towns", disable=(APP_STATE is not None) or not VERBOSE) as bar:
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            chunks.append(chunk)
+            bar.update(len(chunk))
+
+    with zipfile.ZipFile(io.BytesIO(b"".join(chunks))) as zf:
+        with zf.open(CITY_DATA_ZIP_MEMBER) as member, open(CITY_DATA_CACHE_PATH, "wb") as f:
+            shutil.copyfileobj(member, f)
+
+    return CITY_DATA_CACHE_PATH
+
+
+def load_city_candidates(lat, lon, radius_miles):
+    """Stream-parse the cached GeoNames dump, keeping only rows inside a
+    lat/lon bounding box around the point - avoids holding the whole
+    world's worth of towns in memory just to look near one point."""
+    path = ensure_city_data()
+    radius_km = radius_miles * 1.60934
+    lat_buffer = radius_km / KM_PER_DEG_LAT
+    lon_buffer = radius_km / (KM_PER_DEG_LON_AT_EQUATOR * math.cos(math.radians(lat)))
+
+    candidates = []
+    with open(path, encoding="utf-8") as f:
+        for row in csv.reader(f, delimiter="\t"):
+            row_lat, row_lon = float(row[4]), float(row[5])
+            if abs(row_lat - lat) > lat_buffer:
+                continue
+            lon_diff = ((row_lon - lon + 180) % 360) - 180  # signed, wraparound-safe
+            if abs(lon_diff) > lon_buffer:
+                continue
+            country_code = row[8]
+            admin1_code = row[10]
+            population = float(row[14] or 0)
+            candidates.append({
+                "name": row[1],
+                "lat": row_lat,
+                "lon": row_lon,
+                "population": population,
+                "admin1": admin1_code if country_code == "US" and admin1_code else None,
+            })
+    return candidates
+
+
+def select_nearby_cities(candidates, min_population):
+    """Pick up to MAX_CITY_MARKERS towns, largest population first, skipping
+    any candidate within MIN_CITY_SEPARATION_MI of an already-picked town -
+    this is what collapses a cluster of suburbs down to just its largest
+    member instead of showing several overlapping small towns next to one
+    big one. Numbers survivors 1..N in the order picked (i.e. by size)."""
+    eligible = sorted(
+        (c for c in candidates if c["population"] >= min_population),
+        key=lambda c: c["population"], reverse=True,
+    )
+
+    picked = []
+    for c in eligible:
+        if len(picked) >= MAX_CITY_MARKERS:
+            break
+        too_close = any(
+            haversine_km(c["lat"], c["lon"] % 360, np.array([p["lat"]]), np.array([p["lon"] % 360]))[0]
+            <= MIN_CITY_SEPARATION_MI * 1.60934
+            for p in picked
+        )
+        if not too_close:
+            picked.append(c)
+
+    for i, c in enumerate(picked, start=1):
+        c["digit"] = str(i)
+    return picked
+
+
+def nearest_storm_distance_km(lat, lon, lats, lons, data, search_radius_km):
+    """Great-circle distance in km from (lat, lon) to the closest cell at/above
+    PRECIP_THRESHOLD_MMHR, searching out to search_radius_km. None if nothing
+    that close (i.e. the nearest storm, if any, is at least that far away)."""
+    crop_lats, crop_lons, crop_data = crop_grid(lat, lon, lats, lons, data, search_radius_km)
+    mask = crop_data >= PRECIP_THRESHOLD_MMHR
+    if not np.any(mask):
+        return None
+    lat_grid, lon_grid = np.meshgrid(crop_lats, crop_lons, indexing="ij")
+    dist_km = haversine_km(lat, lon % 360, lat_grid[mask], lon_grid[mask])
+    return float(np.min(dist_km))
+
+
 def level_for_rate(rate_mmhr):
     for threshold, char, color in MAP_LEVELS:
         if rate_mmhr < threshold:
@@ -368,18 +485,96 @@ def level_for_rate(rate_mmhr):
     return MAP_LEVELS[-1][1], MAP_LEVELS[-1][2]
 
 
-def map_legend_line():
-    return (
-        "@ = you   "
-        "\x1b[38;5;34m░\x1b[0m light   "
-        "\x1b[38;5;226m▒\x1b[0m moderate   "
-        "\x1b[38;5;208m▓\x1b[0m heavy   "
-        "\x1b[38;5;196m█\x1b[0m very heavy   "
-        "\x1b[38;5;201m█\x1b[0m extreme"
-    )
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def build_map_box_lines(lat, lon, lats, lons, data, radius_miles):
+def _visible_len(s):
+    return len(_ANSI_ESCAPE_RE.sub("", s))
+
+
+def _pad_visible(s, width):
+    return s + " " * max(0, width - _visible_len(s))
+
+
+def _truncate_visible(s, width):
+    """Truncate to at most `width` visible characters, preserving any ANSI
+    escapes (which have zero visible width) in the kept portion."""
+    if _visible_len(s) <= width:
+        return s
+    out, visible = [], 0
+    i = 0
+    while i < len(s):
+        m = _ANSI_ESCAPE_RE.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        if visible >= width:
+            break
+        out.append(s[i])
+        visible += 1
+        i += 1
+    return "".join(out)
+
+
+def build_city_legend_box_lines(cities, height):
+    """Bordered legend box (CITY_LEGEND_BOX_WIDTH wide, `height` tall) for
+    the right side of the radar map: precip-intensity key, then one numbered
+    line per town from select_nearby_cities(). Hand-rolled (not make_box())
+    because make_box's textwrap/ljust padding counts raw characters, which
+    would miscount these ANSI color codes and corrupt the alignment."""
+    interior_w = CITY_LEGEND_BOX_WIDTH - 2
+    interior_h = height - 2
+
+    content = [
+        "\x1b[1;97m@\x1b[0m you",
+        "\x1b[38;5;34m░\x1b[0m light  \x1b[38;5;226m▒\x1b[0m moderate",
+        "\x1b[38;5;208m▓\x1b[0m heavy  \x1b[38;5;196m█\x1b[0m v.heavy",
+        "\x1b[38;5;201m█\x1b[0m extreme",
+        "",
+    ]
+    if cities:
+        content.append("Towns:")
+        for city in cities:
+            label = f"\x1b[1;93m{city['digit']}\x1b[0m {city['name']}"
+            if city["admin1"]:
+                label += f", {city['admin1']}"
+            content.append(label)
+    else:
+        content.append("(no towns found nearby)")
+
+    body = [_truncate_visible(line, interior_w) for line in content][:interior_h]
+    while len(body) < interior_h:
+        body.append("")
+
+    box = ["┌" + "─" * interior_w + "┐"]
+    for line in body:
+        box.append("│" + _pad_visible(line, interior_w) + "│")
+    box.append("└" + "─" * interior_w + "┘")
+    return box
+
+
+def latlon_to_map_cell(point_lat, point_lon, center_lat, center_lon, radius_miles):
+    """Inverse of build_map_box_lines' cell->lat/lon projection: which
+    (row, col) map cell a location falls in, or None if it's outside the
+    visible MAP_ROWS x MAP_COLS grid."""
+    radius_km = radius_miles * 1.60934
+    row_center = MAP_ROWS // 2
+    col_center = MAP_COLS // 2
+    km_per_row = (2 * radius_km) / (MAP_ROWS - 1)
+    km_per_col = km_per_row / 2  # terminal chars are roughly twice as tall as wide
+
+    dy_km = (point_lat - center_lat) * KM_PER_DEG_LAT
+    dx_km = (point_lon - center_lon) * KM_PER_DEG_LON_AT_EQUATOR * math.cos(math.radians(center_lat))
+    r = row_center - round(dy_km / km_per_row)
+    c = col_center + round(dx_km / km_per_col)
+
+    if 0 <= r < MAP_ROWS and 0 <= c < MAP_COLS:
+        return r, c
+    return None
+
+
+def build_map_box_lines(lat, lon, lats, lons, data, radius_miles, cities=()):
     """The bordered radar grid only (no title, no legend) - exactly
     MAP_ROWS + 2 lines, so it can be lined up next to other fixed-height
     boxes in the --watch dashboard layout."""
@@ -391,6 +586,14 @@ def build_map_box_lines(lat, lon, lats, lons, data, radius_miles):
     km_per_row = (2 * radius_km) / (MAP_ROWS - 1)
     km_per_col = km_per_row / 2  # terminal chars are roughly twice as tall as wide
 
+    # Earlier (larger, since `cities` is population-sorted) towns win any
+    # cell collision - setdefault() only ever fills in the first digit seen.
+    city_cells = {}
+    for city in cities:
+        cell = latlon_to_map_cell(city["lat"], city["lon"], lat, lon, radius_miles)
+        if cell is not None and cell != (row_center, col_center):
+            city_cells.setdefault(cell, city["digit"])
+
     lines = ["┌" + "─" * MAP_COLS + "┐"]
     for r in range(MAP_ROWS):
         dy_km = (row_center - r) * km_per_row
@@ -399,6 +602,10 @@ def build_map_box_lines(lat, lon, lats, lons, data, radius_miles):
         for c in range(MAP_COLS):
             if r == row_center and c == col_center:
                 row_chars.append("\x1b[1;97m@\x1b[0m")
+                continue
+
+            if (r, c) in city_cells:
+                row_chars.append(f"\x1b[1;93m{city_cells[(r, c)]}\x1b[0m")
                 continue
 
             dx_km = (c - col_center) * km_per_col
@@ -424,10 +631,11 @@ def build_map_box_lines(lat, lon, lats, lons, data, radius_miles):
     return lines
 
 
-def render_ansi_map(lat, lon, lats, lons, data, radius_miles):
-    lines = [f"Radar mosaic within {radius_miles:.0f} mi of {lat:.4f}, {lon:.4f} (N up):"]
-    lines.extend(build_map_box_lines(lat, lon, lats, lons, data, radius_miles))
-    lines.append(map_legend_line())
+def render_ansi_map(lat, lon, lats, lons, data, radius_miles, cities=()):
+    header = [f"Radar mosaic within {radius_miles:.0f} mi of {lat:.4f}, {lon:.4f} (N up):"]
+    map_box = build_map_box_lines(lat, lon, lats, lons, data, radius_miles, cities)
+    legend_box = build_city_legend_box_lines(cities, len(map_box))
+    lines = header + [m + g for m, g in zip(map_box, legend_box)]
     return "\n".join(lines)
 
 
@@ -878,7 +1086,13 @@ def compute_rain_forecast(cfg, lats, lons, data, valid_time, frames):
         )
 
     forecast = summarize_rain_forecast(series)
-    return {"motion": motion, "series": series, "forecast": forecast}
+    nearest_distance_km = nearest_storm_distance_km(
+        cfg.lat, cfg.lon, lats, lons, data, DYNAMIC_STORM_SEARCH_RADIUS_KM
+    )
+    return {
+        "motion": motion, "series": series, "forecast": forecast,
+        "nearest_distance_km": nearest_distance_km,
+    }
 
 
 def run_analysis(cfg):
@@ -908,7 +1122,7 @@ class AppState:
         self.data = None
         self.motion = None     # estimate_motion_field() result, or None
         self.forecast = None   # summarize_rain_forecast() result, or None
-        self.rain_ended_at = None  # UTC datetime of the last observed raining_now True->False, or None
+        self.nearest_distance_km = None  # nearest_storm_distance_km() result, or None
 
     def log(self, message):
         with self.lock:
@@ -956,81 +1170,52 @@ def run_analysis_cycle(state, cfg):
         state.mark_checked()
         return
 
-    # Track the moment rain actually stops (raining_now flips True->False)
-    # so the dynamic refresh schedule knows when to start its slow-down
-    # ramp. Only run_analysis_cycle's own worker thread ever writes state,
-    # so reading state.forecast/rain_ended_at here without the lock is safe.
-    was_raining = state.forecast["raining_now"] if state.forecast else False
-    now_raining = result["forecast"]["raining_now"]
-    rain_ended_at = state.rain_ended_at
-    if was_raining and not now_raining:
-        rain_ended_at = datetime.datetime.now(datetime.timezone.utc)
-    elif now_raining:
-        rain_ended_at = None  # raining again - any slow-down ramp no longer applies
-
     state.update_result(
         lats=result["lats"], lons=result["lons"], data=result["data"],
         motion=result["motion"], forecast=result["forecast"],
-        rain_ended_at=rain_ended_at,
+        nearest_distance_km=result["nearest_distance_km"],
         last_updated=result["valid_time"],
     )
 
 
 # --- dynamic --watch refresh schedule ---
 
-# Refresh cadence (minutes) when no rain is expected within the forecast
-# window, and the fastest cadence used once rain is imminent or happening.
+# Refresh cadence (minutes) when nothing is within DYNAMIC_STORM_SEARCH_RADIUS_KM,
+# and the fastest cadence used once a storm is right on top of the point.
 DYNAMIC_BASE_INTERVAL_MIN = 15.0
 DYNAMIC_MIN_INTERVAL_MIN = 1.0
-# (minutes until rain starts, refresh interval in minutes), descending by
-# time - refresh ramps smoothly between these as rain approaches. Above the
-# first anchor's time it's flat at DYNAMIC_BASE_INTERVAL_MIN; at/below the
-# last anchor's time (including while it's actively raining, i.e. 0) it's
+# How far out (km) to search for the nearest above-threshold radar cell -
+# comfortably past the 25 mi/40.2 km base-tier boundary below so nothing
+# inside that tier is ever missed by a too-tight search crop.
+DYNAMIC_STORM_SEARCH_RADIUS_KM = 50.0
+# (miles to nearest storm, refresh interval in minutes), descending by
+# distance - refresh ramps smoothly between these as a storm gets closer.
+# Above the first anchor's distance it's flat at DYNAMIC_BASE_INTERVAL_MIN;
+# at/below the last anchor's distance (including 0, i.e. raining now) it's
 # flat at DYNAMIC_MIN_INTERVAL_MIN.
-DYNAMIC_APPROACH_ANCHORS = [(45.0, 10.0), (20.0, 5.0), (10.0, 1.0)]
-# Minutes to ease back up from DYNAMIC_MIN_INTERVAL_MIN to
-# DYNAMIC_BASE_INTERVAL_MIN after rain ends, absent a new storm approaching.
-DYNAMIC_RECOVERY_MIN = 30.0
+DYNAMIC_DISTANCE_ANCHORS_MI = [(25.0, 10.0), (15.0, 5.0), (10.0, 1.0)]
 
 
-def _approach_interval_min(minutes_until_start):
-    """Interpolated refresh interval based on minutes until rain starts (or
-    0 if it's already raining). None means no rain expected in the window."""
-    anchors = DYNAMIC_APPROACH_ANCHORS
-    if minutes_until_start is None or minutes_until_start > anchors[0][0]:
+def _distance_interval_min(distance_mi):
+    """Interpolated refresh interval based on miles to the nearest storm.
+    None means nothing was found within DYNAMIC_STORM_SEARCH_RADIUS_KM."""
+    anchors = DYNAMIC_DISTANCE_ANCHORS_MI
+    if distance_mi is None or distance_mi > anchors[0][0]:
         return DYNAMIC_BASE_INTERVAL_MIN
-    if minutes_until_start <= anchors[-1][0]:
+    if distance_mi <= anchors[-1][0]:
         return DYNAMIC_MIN_INTERVAL_MIN
-    for (t_hi, v_hi), (t_lo, v_lo) in zip(anchors, anchors[1:]):
-        if t_lo <= minutes_until_start <= t_hi:
-            frac = (minutes_until_start - t_lo) / (t_hi - t_lo)
+    for (d_hi, v_hi), (d_lo, v_lo) in zip(anchors, anchors[1:]):
+        if d_lo <= distance_mi <= d_hi:
+            frac = (distance_mi - d_lo) / (d_hi - d_lo)
             return v_lo + frac * (v_hi - v_lo)
     return DYNAMIC_MIN_INTERVAL_MIN
 
 
-def _recovery_interval_min(rain_ended_at, now):
-    """Interpolated refresh interval easing back up to base over
-    DYNAMIC_RECOVERY_MIN minutes since rain ended, or None if that ramp
-    doesn't apply (rain hasn't ended, or the ramp has already finished)."""
-    if rain_ended_at is None:
-        return None
-    elapsed_min = (now - rain_ended_at).total_seconds() / 60.0
-    if elapsed_min >= DYNAMIC_RECOVERY_MIN:
-        return None
-    frac = elapsed_min / DYNAMIC_RECOVERY_MIN
-    return DYNAMIC_MIN_INTERVAL_MIN + frac * (DYNAMIC_BASE_INTERVAL_MIN - DYNAMIC_MIN_INTERVAL_MIN)
-
-
-def compute_dynamic_interval_minutes(forecast, rain_ended_at, now):
-    """Combine the approaching-storm ramp-down with the post-rain ramp-up.
-    While still easing back up from a just-ended rain, a newly approaching
-    storm should never be allowed to poll slower than its own ramp calls
-    for, so the faster (smaller) of the two wins."""
-    approach = _approach_interval_min(forecast["start_min"] if forecast else None)
-    recovery = _recovery_interval_min(rain_ended_at, now)
-    if recovery is None:
-        return approach
-    return min(approach, recovery)
+def compute_dynamic_interval_minutes(nearest_distance_km):
+    if nearest_distance_km is None:
+        return DYNAMIC_BASE_INTERVAL_MIN
+    distance_mi, _ = convert_distance(nearest_distance_km, "miles")
+    return _distance_interval_min(distance_mi)
 
 
 def worker_loop(state, cfg, fixed_interval_seconds):
@@ -1047,15 +1232,14 @@ def worker_loop(state, cfg, fixed_interval_seconds):
             interval_seconds = fixed_interval_seconds
         else:
             snapshot = state.snapshot()
-            now = datetime.datetime.now(datetime.timezone.utc)
-            interval_min = compute_dynamic_interval_minutes(snapshot.forecast, snapshot.rain_ended_at, now)
+            interval_min = compute_dynamic_interval_minutes(snapshot.nearest_distance_km)
             interval_seconds = interval_min * 60.0
 
         state.set_next_check(time.time() + interval_seconds)
         state.stop_event.wait(interval_seconds)
 
 
-def build_rain_status_box_lines(snapshot):
+def build_rain_status_box_lines(units, snapshot):
     if snapshot.forecast is None:
         return make_box("RAIN STATUS", ["Gathering radar history..."],
                          STORM_BOX_WIDTH, STORM_BOX_HEIGHT)
@@ -1064,6 +1248,12 @@ def build_rain_status_box_lines(snapshot):
     base_utc = to_utc_datetime(snapshot.last_updated)
     lines = ["Raining now at your location." if forecast["raining_now"]
              else "Not raining at your location."]
+
+    if snapshot.nearest_distance_km is None:
+        lines.append(f"No storm within {DYNAMIC_STORM_SEARCH_RADIUS_KM:.0f} km.")
+    else:
+        distance, distance_label = convert_distance(snapshot.nearest_distance_km, units)
+        lines.append(f"Nearest storm: {distance:.1f} {distance_label} away.")
 
     if forecast["start_min"] is None:
         lines.append("No rain expected in the forecast window.")
@@ -1122,7 +1312,7 @@ def build_status_box_lines(radar_info, fixed_interval_seconds, snapshot, width, 
     return make_box("STATUS", lines, width, height)
 
 
-def build_frame(cfg, radar_info, map_radius, fixed_interval_seconds, snapshot):
+def build_frame(cfg, radar_info, map_radius, fixed_interval_seconds, snapshot, cities):
     header = (
         f" NEAREST PRECIP MONITOR - {cfg.lat:.4f}, {cfg.lon:.4f} - "
         f"{next_check_text(snapshot, fixed_interval_seconds)} "
@@ -1135,16 +1325,18 @@ def build_frame(cfg, radar_info, map_radius, fixed_interval_seconds, snapshot):
             MAP_BOX_WIDTH, MAP_ROWS + 2,
         )
     else:
-        map_box = build_map_box_lines(cfg.lat, cfg.lon, snapshot.lats, snapshot.lons, snapshot.data, map_radius)
+        map_box = build_map_box_lines(
+            cfg.lat, cfg.lon, snapshot.lats, snapshot.lons, snapshot.data, map_radius, cities
+        )
 
-    # Radar map on top, centered in the 80-col frame.
-    map_indent = " " * ((DASHBOARD_MIN_COLS - MAP_BOX_WIDTH) // 2)
-    lines.extend(map_indent + line for line in map_box)
-    lines.append(map_indent + map_legend_line() if snapshot.lats is not None else "")
+    # Radar map and town legend side by side, spanning the full 80-col frame.
+    legend_box = build_city_legend_box_lines(cities, MAP_ROWS + 2)
+    for left, right in zip(map_box, legend_box):
+        lines.append(left + right)
     lines.append("")
 
     # Rain status and storm motion boxes side by side below the map.
-    rain_box = build_rain_status_box_lines(snapshot)
+    rain_box = build_rain_status_box_lines(cfg.units, snapshot)
     motion_box = build_motion_box_lines(cfg.units, snapshot, cfg.lookback_min)
     for left, right in zip(rain_box, motion_box):
         lines.append(left + right)
@@ -1155,7 +1347,7 @@ def build_frame(cfg, radar_info, map_radius, fixed_interval_seconds, snapshot):
     return "\n".join(lines)
 
 
-def run_dashboard(cfg, radar_info, map_radius, fixed_interval_seconds):
+def run_dashboard(cfg, radar_info, map_radius, fixed_interval_seconds, cities):
     term_size = shutil.get_terminal_size(fallback=(DASHBOARD_MIN_COLS, DASHBOARD_MIN_ROWS))
     if term_size.columns < DASHBOARD_MIN_COLS or term_size.lines < DASHBOARD_MIN_ROWS:
         print(
@@ -1176,7 +1368,7 @@ def run_dashboard(cfg, radar_info, map_radius, fixed_interval_seconds):
         print("\x1b[?25l", end="")  # hide cursor
         while True:
             snapshot = state.snapshot()
-            frame = build_frame(cfg, radar_info, map_radius, fixed_interval_seconds, snapshot)
+            frame = build_frame(cfg, radar_info, map_radius, fixed_interval_seconds, snapshot, cities)
             print("\x1b[H\x1b[J" + frame, end="", flush=True)
             time.sleep(1.0)
     except KeyboardInterrupt:
@@ -1203,8 +1395,8 @@ def main():
                          help="run as a continuously-updating full-screen dashboard")
     parser.add_argument("--interval", type=float, default=None,
                          help="seconds between radar checks in --watch mode (default: dynamic - "
-                              "polls every 15 min normally, ramping down to every 1 min as rain "
-                              "approaches/occurs and easing back up after it ends; pass a value "
+                              "polls every 15 min normally, ramping down to every 1 min as the "
+                              "nearest storm gets within 25 miles of your location; pass a value "
                               "for a fixed cadence instead)")
     args = parser.parse_args()
     VERBOSE = args.verbose
@@ -1224,8 +1416,17 @@ def main():
         radar = {"radar_station": "?", "forecast_office": "?", "city": "?", "state": "?"}
         print(f"Could not look up local radar station: {exc}")
 
+    cities = []
+    if args.watch or args.map:
+        vprint("[download] Looking up nearby towns...")
+        try:
+            candidates = load_city_candidates(cfg.lat, cfg.lon, args.map_radius)
+            cities = select_nearby_cities(candidates, cfg.city_min_population)
+        except (requests.RequestException, zipfile.BadZipFile, OSError) as exc:
+            print(f"Could not load town/city reference data (map will show no town labels): {exc}")
+
     if args.watch:
-        run_dashboard(cfg, radar, args.map_radius, args.interval)
+        run_dashboard(cfg, radar, args.map_radius, args.interval, cities)
         return
 
     result = run_analysis(cfg)
@@ -1233,7 +1434,9 @@ def main():
 
     if args.map:
         print()
-        print(render_ansi_map(cfg.lat, cfg.lon, result["lats"], result["lons"], result["data"], args.map_radius))
+        print(render_ansi_map(
+            cfg.lat, cfg.lon, result["lats"], result["lons"], result["data"], args.map_radius, cities
+        ))
         print()
 
     forecast = result["forecast"]
